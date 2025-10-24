@@ -1,0 +1,100 @@
+# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+"""Custom replacement for `torch.nn.functional.grid_sample` that
+supports arbitrarily high order gradients between the input and output.
+Only works on 2D images and assumes
+`mode='bilinear'`, `padding_mode='zeros'`, `align_corners=False`.
+
+code is changed from: https://github.com/NVlabs/stylegan3"""
+
+import torch
+from pkg_resources import parse_version
+
+torch_grid_sample = torch.nn.functional.grid_sample
+
+# pylint: disable=redefined-builtin
+# pylint: disable=arguments-differ
+# pylint: disable=protected-access
+
+#----------------------------------------------------------------------------
+
+enabled = True  # Enable the custom op by setting this to true.
+_use_pytorch_1_11_api = parse_version(torch.__version__) >= parse_version('1.11.0a') # Allow prerelease builds of 1.11
+
+#----------------------------------------------------------------------------
+
+def grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=None):
+    if _should_use_custom_op():
+        return _GridSample2dForward.apply(input, grid, mode, padding_mode, align_corners)
+    return torch_grid_sample(input=input, grid=grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+torch.nn.functional.grid_sample = grid_sample
+
+#----------------------------------------------------------------------------
+
+def _should_use_custom_op():
+    return enabled
+
+#----------------------------------------------------------------------------
+
+class _GridSample2dForward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, grid, mode, padding_mode, align_corners):
+        assert input.ndim == 4
+        assert grid.ndim == 4
+        output = torch_grid_sample(input=input, grid=grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        ctx.save_for_backward(input, grid)
+        ctx.mode = mode
+        ctx.padding_mode = padding_mode
+        ctx.align_corners = align_corners
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, grid = ctx.saved_tensors
+        grad_input, grad_grid = _GridSample2dBackward.apply(grad_output, input, grid, ctx.mode, ctx.padding_mode, ctx.align_corners)
+        return grad_input, grad_grid, None, None, None
+
+#----------------------------------------------------------------------------
+
+class _GridSample2dBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, grad_output, input, grid, mode, padding_mode, align_corners):
+        op = torch._C._jit_get_operation('aten::grid_sampler_2d_backward')[0]
+        ctx.mode = mode
+        ctx.padding_mode = padding_mode
+        ctx.align_corners = align_corners
+
+        mode_mapping = {'bilinear': 0, 'nearest': 1}
+        padding_mode_mapping = {'zeros': 0, 'border': 1, 'reflection': 2}
+
+        mode_int = mode_mapping[mode]
+        padding_mode_int = padding_mode_mapping[padding_mode]
+
+        if _use_pytorch_1_11_api:
+            output_mask = (ctx.needs_input_grad[1], ctx.needs_input_grad[2])
+            grad_input, grad_grid = op(grad_output, input, grid, mode_int, padding_mode_int, align_corners, output_mask)
+        else:
+            grad_input, grad_grid = op(grad_output, input, grid, mode_int, padding_mode_int, align_corners)
+        ctx.save_for_backward(grid)
+        return grad_input, grad_grid
+
+    @staticmethod
+    def backward(ctx, grad2_grad_input, grad2_grad_grid):
+        _ = grad2_grad_grid # unused
+        grid, = ctx.saved_tensors
+        grad2_grad_output = None
+        grad2_input = None
+        grad2_grid = None
+
+        if ctx.needs_input_grad[0]:
+            grad2_grad_output = _GridSample2dForward.apply(grad2_grad_input, grid, ctx.mode, ctx.padding_mode, ctx.align_corners)
+
+        return grad2_grad_output, grad2_input, grad2_grid, None, None, None
+
+#----------------------------------------------------------------------------
